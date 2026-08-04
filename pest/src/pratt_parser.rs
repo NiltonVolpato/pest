@@ -10,6 +10,7 @@
 //! Constructs useful in prefix, postfix, and infix operator parsing with the
 //! Pratt parsing method.
 
+use core::cmp::Ordering;
 use core::iter::Peekable;
 use core::marker::PhantomData;
 use core::ops::BitOr;
@@ -117,7 +118,7 @@ impl<R: RuleType> BitOr for Op<R> {
 ///
 /// ```pest
 /// WHITESPACE   =  _{ " " | "\t" | NEWLINE }
-///  
+///
 /// program      =   { SOI ~ expr ~ EOI }
 ///   expr       =   { prefix* ~ primary ~ postfix* ~ (infix ~ prefix* ~ primary ~ postfix* )* }
 ///     infix    =  _{ add | sub | mul | div | pow }
@@ -278,37 +279,29 @@ impl<R: RuleType> PrattParserOps<R> for PrattParser<R> {
 /// memory.
 ///
 /// It is functionally equivalent to [`PrattParser`], but it is constructed from
-/// a static slice of operators rather than the chained `.op(...)` builder.
+/// an array of operators rather than the chained `.op(...)` builder.
 ///
 /// [`PrattParser`]: struct.PrattParser.html
-pub struct ConstPrattParser<R: RuleType + 'static> {
-    ops: &'static [(R, Affix, Prec)],
+pub struct ConstPrattParser<R: RuleType + 'static, const N: usize> {
+    rules: [R; N],
+    ops: [(Affix, Prec); N],
 }
 
-impl<R: RuleType + 'static> ConstPrattParser<R> {
-    /// Create a `ConstPrattParser` from a static slice of operators.
+impl<R: RuleType + 'static, const N: usize> ConstPrattParser<R, N> {
+    /// Create a `ConstPrattParser` from an array of operators.
     ///
     /// Each tuple is `(rule, affix, precedence)`. Higher precedence values bind
     /// more tightly. The absolute values do not matter, only their ordering.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use pest::pratt_parser::{Affix, Assoc, ConstPrattParser};
-    /// # #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-    /// # enum Rule { expr, int, add, sub, mul, div, pow, neg, fac }
-    /// static PRATT: ConstPrattParser<Rule> = ConstPrattParser::new_const(&[
-    ///     (Rule::add, Affix::Infix(Assoc::Left), 1),
-    ///     (Rule::sub, Affix::Infix(Assoc::Left), 1),
-    ///     (Rule::mul, Affix::Infix(Assoc::Left), 2),
-    ///     (Rule::div, Affix::Infix(Assoc::Left), 2),
-    ///     (Rule::pow, Affix::Infix(Assoc::Right), 3),
-    ///     (Rule::neg, Affix::Prefix, 4),
-    ///     (Rule::fac, Affix::Postfix, 5),
-    /// ]);
-    /// ```
-    pub const fn new_const(ops: &'static [(R, Affix, Prec)]) -> Self {
-        Self { ops }
+    pub const fn new_const(operators: [(R, Affix, Prec); N]) -> Self {
+        let mut rules = [operators[0].0; N];
+        let mut ops = [(operators[0].1, operators[0].2); N];
+        let mut i = 0;
+        while i < N {
+            rules[i] = operators[i].0;
+            ops[i] = (operators[i].1, operators[i].2);
+            i += 1;
+        }
+        Self { rules, ops }
     }
 
     /// Maps primary expressions with a closure `primary`.
@@ -329,19 +322,122 @@ impl<R: RuleType + 'static> ConstPrattParser<R> {
             phantom: PhantomData,
         }
     }
-}
 
-impl<R: RuleType + 'static> PrattParserOps<R> for ConstPrattParser<R> {
-    fn get(&self, rule: &R) -> Option<(Affix, Prec)> {
-        let mut i = 0;
-        while i < self.ops.len() {
-            if self.ops[i].0 == *rule {
-                return Some((self.ops[i].1, self.ops[i].2));
+    fn find_slow(&self, value: R) -> Option<usize> {
+        for (i, op) in self.rules.iter().enumerate() {
+            if let Ordering::Equal = op.cmp(&value) {
+                return Some(i);
             }
-            i += 1;
         }
         None
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn find_simd<const N: usize>(arr: &[u16; N], value: u16) -> Option<usize> {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    pub unsafe fn neon_movemask_u16(cmp_u16: uint16x8_t) -> u8 {
+        // 1. Shift right narrowing: takes top bit of each 16-bit lane -> uint8x8_t
+        // Input:  [0xFFFF, 0x0000, 0xFFFF, ...] (8 x u16)
+        // Output: [0x00FF, 0x0000, 0x00FF, ...] (8 x u8)
+        let narrowed = vshrn_n_u16(cmp_u16, 8);
+
+        // 2. Bit weight vector [1, 2, 4, 8, 16, 32, 64, 128]
+        let weights = vld1_u8([1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+        let masked = vand_u8(narrowed, weights);
+
+        // 3. Horizontal sum of 8 bytes into a single u8 scalar
+        vaddv_u8(masked)
+    }
+
+    if N < 8 {
+        return None;
+    }
+
+    let ptr = arr.as_ptr();
+    let full_chunks = N / 8;
+    let remainder = N % 8;
+
+    unsafe {
+        let target_vec = vdupq_n_u16(value);
+
+        let mut i = 0;
+        while i < full_chunks {
+            let offset = i * 8;
+            let chunk = vld1q_u16(ptr.add(offset));
+            let cmp = vceqq_u16(chunk, target_vec);
+
+            if vmaxvq_u16(cmp) != 0 {
+                let mask = neon_movemask_u16(cmp);
+                let match_idx = mask.trailing_zeros() as usize;
+                return Some(offset + match_idx);
+            }
+
+            i += 1;
+        }
+
+        if remainder != 0 {
+            let offset = N - 8;
+            let chunk = vld1q_u16(ptr.add(offset));
+            let cmp = vceqq_u16(chunk, target_vec);
+
+            if vmaxvq_u16(cmp) != 0 {
+                let mask = neon_movemask_u16(cmp);
+                let match_idx = mask.trailing_zeros() as usize;
+                return Some(offset + match_idx);
+            }
+        }
+    }
+
+    None
+}
+
+impl<R: RuleType + 'static, const N: usize> PrattParserOps<R> for ConstPrattParser<R, N> {
+    #[inline]
+    fn get(&self, rule: &R) -> Option<(Affix, Prec)> {
+        let idx = if size_of::<R>() == 2 && N >= 8 && cfg!(target_arch = "aarch64") {
+            unsafe {
+                find_simd::<N>(
+                    core::mem::transmute(&self.rules),
+                    core::mem::transmute_copy(rule),
+                )
+            }
+        } else {
+            self.find_slow(*rule)
+        };
+        idx.map(|i| self.ops[i])
+    }
+
+    /*
+    #[inline]
+    fn get(&self, rule: &R) -> Option<(Affix, Prec)> {
+        for (k, op) in self.rules.iter().zip(self.ops.iter()) {
+            if let Ordering::Equal = k.cmp(rule) {
+                return Some(*op);
+            }
+        }
+        None
+    }
+    */
+
+    /*
+        #[inline]
+        fn get(&self, rule: &R) -> Option<(Affix, Prec)> {
+            let range = self.rules.as_ptr_range();
+            let mut p = range.start;
+            while p != range.end {
+                if unsafe { *p } == *rule {
+                    return Some(unsafe {
+                        *self.ops.get_unchecked(p.offset_from_unsigned(range.start))
+                    });
+                }
+                p = unsafe { p.add(1) };
+            }
+            None
+        }
+    */
 }
 
 type PrefixFn<'a, 'i, R, T> = Box<dyn FnMut(Pair<'i, R>, T) -> T + 'a>;

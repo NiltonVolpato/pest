@@ -116,7 +116,7 @@ impl Parser<Rule> for CalculatorParser {
 #[allow(deprecated)]
 enum PrattOrPrecClimber<'a> {
     Pratt(&'a PrattParser<Rule>),
-    ConstPratt(&'a ConstPrattParser<Rule>),
+    ConstPratt(&'a ConstPrattParser<Rule, 6>),
     PrecClimber(&'a pest::prec_climber::PrecClimber<Rule>),
 }
 
@@ -251,7 +251,7 @@ fn pratt_parse() {
 
 #[test]
 fn const_pratt_parse() {
-    static PRATT: ConstPrattParser<Rule> = ConstPrattParser::new_const(&[
+    static PRATT: ConstPrattParser<Rule, 6> = ConstPrattParser::new_const([
         (Rule::plus, Affix::Infix(Assoc::Left), 1),
         (Rule::minus, Affix::Infix(Assoc::Left), 1),
         (Rule::times, Affix::Infix(Assoc::Left), 2),
